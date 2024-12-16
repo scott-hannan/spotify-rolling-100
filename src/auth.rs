@@ -6,6 +6,7 @@ use std::sync::Arc;
 use rand::{distributions::Alphanumeric, Rng};
 use url::form_urlencoded::Serializer;
 use serde::{Deserialize, Serialize};
+use base64::{Engine as _, engine::general_purpose};
 
 
 static CLIENT_ID: Lazy<String> = Lazy::new(|| {
@@ -24,15 +25,79 @@ pub struct CallbackQuery {
 }
 
 #[derive(Serialize, Deserialize)]
-struct TokenResponse {
+pub struct TokenResponse {
     access_token: String,
     token_type: String,
     expires_in: u64,
     refresh_token: Option<String>,
 }
 
-pub async fn callback(query: web::Query<CallbackQuery>, client: web::Data<Client>) -> impl Responder {
-    let code = &query.code.as_deref().expect("Expected a code");;
+#[derive(Serialize, Deserialize)]
+pub struct TokenRefreshResponse {
+    #[serde(flatten)]
+    base: TokenResponse,
+    scope: String,
+}
+
+async fn refresh_access_token(token_response: web::Json<TokenResponse>, client: web::Data<Arc<Client>>) -> impl Responder{
+    let refresh_token = match &token_response.refresh_token {
+        Some(token) => token,
+        None => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "missing_refresh_token",
+                "message": "Refresh token is required."
+            }));
+        }
+    };
+    let refresh_url = "https://accounts.spotify.com/api/token";
+
+
+    let credentials = general_purpose::STANDARD.encode(format!("{}:{}", CLIENT_ID.as_str(), CLIENT_SECRET.as_str()));
+    let authorization_header = format!("Basic {}", credentials);
+
+    let form_data = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+
+    let refresh_response = client
+        .post(refresh_url)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("Authorization", authorization_header)
+        .form(&form_data)
+        .send()
+        .await;
+
+        match refresh_response {
+            Ok(resp) if resp.status().is_success() => match resp.json::<TokenRefreshResponse>().await {
+                Ok(token_response) => HttpResponse::Ok().json(token_response),
+                Err(err) => {
+                    log::error!("Failed to parse response: {:?}", err);
+
+                    HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": "response_parsing_failed",
+                    "message": "Failed to parse Spotify's response."
+                }))},
+            },
+            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                log::warn!("Unauthorized response: {:?}", resp);
+                HttpResponse::Unauthorized().json(serde_json::json!({
+                "error": "invalid_refresh_token",
+                "message": "The provided refresh token is invalid or expired."
+            }))},
+            Ok(_) => HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "unknown_error",
+                "message": "An unknown error occurred while communicating with Spotify."
+            })),
+            Err(_) => HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "spotify_api_unreachable",
+                "message": "Failed to communicate with Spotify's API. Please try again later."
+            })),
+        }
+}
+
+pub async fn callback(query: web::Query<CallbackQuery>, client: web::Data<Arc<Client>>) -> impl Responder {
+    let code = &query.code.as_deref().expect("Expected a code");
     let state = &query.state;
 
     if state.is_none() {
